@@ -1,4 +1,4 @@
-# Updated: Feb 4, 2026 - Force redeploy v2
+# Updated: Feb 4, 2026 - Enhanced with first-time buyers & whale tracking
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -31,6 +31,19 @@ WETH_ADDRESS = '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
 
 # Whale alert threshold (WETH)
 WHALE_THRESHOLD = 0.3  # 0.3 ETH
+
+# Known whale/project wallets (add addresses here)
+KNOWN_WALLETS = {
+    # Example format - add real addresses:
+    # '0x...': '🏦 Project Treasury',
+    # '0x...': '🐋 Known Whale "BigBuyer"',
+    # '0x...': '👨‍💼 Team Wallet',
+    # Add more as you discover them
+}
+
+# Track all wallets that have ever traded
+seen_wallets = set()
+first_time_buyers = set()
 
 # Minimal Transfer event ABI (ERC20)
 transfer_abi = [{
@@ -74,9 +87,9 @@ daily_volume = {
     'sell_count': 0,
 }
 
-# Top holders cache
-top_holders = []
-top_holders_last_update = 0
+# Top 20 holders tracking
+top_20_holders = set()
+top_20_last_update = 0
 
 async def get_eth_price():
     """Get ETH price in USD"""
@@ -114,39 +127,50 @@ async def get_token_info():
     
     return price_cache.get('price', 0), price_cache.get('mcap', 0)
 
-async def get_top_holders():
-    """Get top 10 holders from on-chain data"""
-    global top_holders, top_holders_last_update
+async def update_top_20_holders():
+    """Update top 20 holders list (simplified version)"""
+    global top_20_holders, top_20_last_update
     
-    # Update every 5 minutes
+    # Update every 10 minutes
     now = datetime.now().timestamp()
-    if now - top_holders_last_update < 300 and top_holders:
-        return top_holders
+    if now - top_20_last_update < 600:
+        return
     
     try:
-        # Note: This is a simplified version
-        # In production, you'd query from a service like Etherscan API or The Graph
-        # For now, we'll track holders as we see them
-        print("📊 Top holders cache refreshed")
-        top_holders_last_update = now
-        return top_holders
+        # In production, you'd fetch from Arbiscan API or The Graph
+        # For now, we'll track holders as we see large holders
+        print("📊 Top 20 holders cache refreshed")
+        top_20_last_update = now
     except Exception as e:
-        print(f"Error getting top holders: {e}")
-        return []
+        print(f"Error updating top 20: {e}")
 
-def is_top_holder(wallet):
-    """Check if wallet is in top 10 holders"""
-    return wallet.lower() in [h.lower() for h in top_holders]
+def is_top_20_holder(wallet):
+    """Check if wallet is in top 20 holders"""
+    return wallet.lower() in top_20_holders
 
-def update_top_holders(wallet, balance_pct):
-    """Update top holders list"""
-    global top_holders
-    
-    if balance_pct >= 1.0:  # Only track holders with >1%
-        if wallet.lower() not in [h.lower() for h in top_holders]:
-            top_holders.append(wallet)
-            if len(top_holders) > 10:
-                top_holders = top_holders[:10]
+def add_to_top_20(wallet, balance_pct):
+    """Add wallet to top 20 if they hold enough"""
+    if balance_pct >= 0.5:  # Top 20 usually holds >0.5% each
+        top_20_holders.add(wallet.lower())
+        if len(top_20_holders) > 20:
+            # Keep only 20 (in production, you'd sort by balance)
+            top_20_holders.pop()
+
+def is_first_time_buyer(wallet):
+    """Check if this is the wallet's first buy"""
+    wallet = wallet.lower()
+    if wallet not in seen_wallets:
+        seen_wallets.add(wallet)
+        first_time_buyers.add(wallet)
+        return True
+    return False
+
+def get_wallet_label(wallet):
+    """Get special label for known wallets"""
+    wallet_lower = wallet.lower()
+    if wallet_lower in KNOWN_WALLETS:
+        return KNOWN_WALLETS[wallet_lower]
+    return None
 
 async def get_holder_percentage(wallet):
     """Get percentage of supply held by wallet"""
@@ -173,8 +197,8 @@ async def get_holder_percentage(wallet):
         
         percentage = (balance / total_supply) * 100
         
-        # Update top holders list
-        update_top_holders(wallet, percentage)
+        # Update top 20 list
+        add_to_top_20(wallet, percentage)
         
         return percentage
     except:
@@ -291,16 +315,18 @@ async def send_whale_alert(swap_type, weth_amount, usd_value, talos_amount, user
     except Exception as e:
         print(f"Error sending whale alert: {e}")
 
-async def send_top_holder_alert(swap_type, user_wallet, talos_amount, holder_pct, tx_hash):
-    """Send alert when top holder trades"""
-    emoji = "👑" if swap_type == "BUY" else "⚠️"
+async def send_top_20_alert(swap_type, user_wallet, talos_amount, holder_pct, tx_hash, weth_amount, usd_value):
+    """Send alert when top 20 holder trades"""
+    emoji = "👑🟢" if swap_type == "BUY" else "👑🔴"
     
     msg = (
-        f"{emoji} TOP HOLDER ACTIVITY {emoji}\n\n"
-        f"A top 10 holder just made a {swap_type}!\n\n"
+        f"{emoji} TOP 20 HOLDER ACTIVITY {emoji}\n\n"
+        f"A TOP 20 holder just made a {swap_type}!\n\n"
+        f"💵 {weth_amount:.3f} WETH (${usd_value:,.2f})\n"
         f"💰 {talos_amount:,.1f} ${TOKEN_SYMBOL}\n"
         f"👤 Holds {holder_pct:.2f}% of supply\n"
-        f"🔗 [View Transaction](https://arbiscan.io/tx/{tx_hash})"
+        f"🔗 [View Transaction](https://arbiscan.io/tx/{tx_hash})\n\n"
+        f"⚠️ Monitor this carefully!"
     )
     
     try:
@@ -310,12 +336,19 @@ async def send_top_holder_alert(swap_type, user_wallet, talos_amount, holder_pct
             parse_mode='Markdown',
             disable_web_page_preview=True
         )
-        print("👑 Top holder alert sent!")
+        print("👑 Top 20 holder alert sent!")
     except Exception as e:
-        print(f"Error sending top holder alert: {e}")
+        print(f"Error sending top 20 alert: {e}")
 
 async def ping(update, context):
-    await update.message.reply_text(f'🤖 Monitoring {TOKEN_SYMBOL} swaps with advanced tracking!')
+    total_wallets = len(seen_wallets)
+    new_buyers = len(first_time_buyers)
+    await update.message.reply_text(
+        f'🤖 Monitoring {TOKEN_SYMBOL} swaps!\n\n'
+        f'👥 Tracked wallets: {total_wallets}\n'
+        f'🆕 First-time buyers: {new_buyers}\n'
+        f'👑 Top 20 tracked: {len(top_20_holders)}'
+    )
 
 async def volume_command(update, context):
     """Show daily volume stats"""
@@ -453,8 +486,10 @@ async def handle_transfer(event):
             holder_pct = await get_holder_percentage(user_wallet)
             holder_emoji = get_holder_emoji(holder_pct)
             
-            # Check if top holder
-            is_top = is_top_holder(user_wallet)
+            # Check special wallet status
+            is_first_timer = is_first_time_buyer(user_wallet) and swap_type == "BUY"
+            is_top_20 = is_top_20_holder(user_wallet)
+            wallet_label = get_wallet_label(user_wallet)
             
             # Get whale category
             category, robots = get_whale_category(weth_amount)
@@ -474,20 +509,26 @@ async def handle_transfer(event):
                 emoji = "💸"
                 action = "Sell!"
             
-            # Add top holder badge
-            top_holder_badge = " 👑" if is_top else ""
+            # Build badges
+            badges = ""
+            if is_first_timer:
+                badges += " 🆕"
+            if is_top_20:
+                badges += " 👑"
+            if wallet_label:
+                badges += f" {wallet_label}"
             
             # Make wallet address clickable
             wallet_link = f"https://arbiscan.io/address/{user_wallet}"
             
             msg = (
-                f"{emoji} ${TOKEN_SYMBOL} {action} {emoji}{top_holder_badge}\n"
+                f"{emoji} ${TOKEN_SYMBOL} {action} {emoji}{badges}\n"
                 f"🏪 {dex_name}\n\n"
                 f"{robots}\n\n"
                 f"💵 {weth_amount:.3f} WETH (${usd_value:,.2f})\n"
                 f"💰 {talos_formatted} ${TOKEN_SYMBOL}\n"
                 f"👤 [{user_wallet[:6]}...{user_wallet[-4:]}]({wallet_link}) | [Txn](https://arbiscan.io/tx/{tx_hash})\n"
-                f"🐟 {holder_emoji} | +{holder_pct:.1f}%\n"
+                f"🐟 {holder_emoji} | {holder_pct:.1f}%\n"
                 f"💲 Price: ${token_price:.6f}\n"
                 f"📊 Market Cap: {mcap_formatted}"
             )
@@ -497,8 +538,12 @@ async def handle_transfer(event):
             print(f"DEX: {dex_name}")
             print(f"WETH: {weth_amount:.3f} (${usd_value:,.2f})")
             print(f"Category: {category}")
-            if is_top:
-                print("👑 TOP HOLDER!")
+            if is_first_timer:
+                print("🆕 FIRST-TIME BUYER!")
+            if is_top_20:
+                print("👑 TOP 20 HOLDER!")
+            if wallet_label:
+                print(f"🏷️  {wallet_label}")
             print(f"{'='*50}")
             
             # Send regular message
@@ -529,9 +574,9 @@ async def handle_transfer(event):
             if weth_amount >= WHALE_THRESHOLD:
                 await send_whale_alert(swap_type, weth_amount, usd_value, talos_amount, user_wallet, tx_hash, dex_name)
             
-            # Send top holder alert
-            if is_top:
-                await send_top_holder_alert(swap_type, user_wallet, talos_amount, holder_pct, tx_hash)
+            # Send top 20 holder alert
+            if is_top_20:
+                await send_top_20_alert(swap_type, user_wallet, talos_amount, holder_pct, tx_hash, weth_amount, usd_value)
         
         processed_txs.add(tx_hash)
         if len(processed_txs) > 100:
@@ -566,11 +611,15 @@ async def send_daily_summary():
                 f"🟢 BUYS: {daily_volume['buy_count']} | ${buy_usd:,.2f}\n"
                 f"🔴 SELLS: {daily_volume['sell_count']} | ${sell_usd:,.2f}\n\n"
                 f"💰 Total Volume: ${total_usd:,.2f}\n"
-                f"📊 {TOKEN_SYMBOL} Traded: {(daily_volume['buy_volume_talos'] + daily_volume['sell_volume_talos']):,.0f}"
+                f"📊 {TOKEN_SYMBOL} Traded: {(daily_volume['buy_volume_talos'] + daily_volume['sell_volume_talos']):,.0f}\n\n"
+                f"🆕 New buyers today: {len(first_time_buyers)}"
             )
             
             await bot.send_message(chat_id=CHAT_ID, text=msg)
             print("📅 Daily summary sent!")
+            
+            # Reset first-time buyers for new day
+            first_time_buyers.clear()
             
         except Exception as e:
             print(f"Error sending daily summary: {e}")
@@ -588,6 +637,9 @@ async def watch_token_transfers():
     else:
         print(f'   Logo: ⚠️  Not found\n')
     
+    # Update top 20 holders periodically
+    asyncio.create_task(periodic_top_20_update())
+    
     event_filter = None
     retry_count = 0
     poll_count = 0
@@ -595,7 +647,7 @@ async def watch_token_transfers():
     while True:
         try:
             if event_filter is None:
-                event_filter = contract.events.Transfer.create_filter(fromBlock='latest')  # FIXED: Changed from_block to fromBlock
+                event_filter = contract.events.Transfer.create_filter(fromBlock='latest')
                 if retry_count > 0:
                     print(f'✅ Reconnected')
                 retry_count = 0
@@ -609,7 +661,7 @@ async def watch_token_transfers():
             else:
                 if poll_count % 20 == 0:
                     # Show volume update
-                    print(f'⏳ Monitoring... | Today: {daily_volume["buy_count"]}B / {daily_volume["sell_count"]}S')
+                    print(f'⏳ Monitoring... | Today: {daily_volume["buy_count"]}B / {daily_volume["sell_count"]}S | Tracked: {len(seen_wallets)} wallets')
             
             await asyncio.sleep(3)
             
@@ -618,6 +670,12 @@ async def watch_token_transfers():
             print(f'❌ Error: {str(e)[:80]}')
             event_filter = None
             await asyncio.sleep(10)
+
+async def periodic_top_20_update():
+    """Periodically update top 20 holders"""
+    while True:
+        await asyncio.sleep(600)  # Every 10 minutes
+        await update_top_20_holders()
 
 async def main():
     print('\n' + '='*60)
@@ -633,7 +691,7 @@ async def main():
     await application.updater.start_polling()
     
     print('🤖 Telegram Bot: CONNECTED')
-    print('📊 Features: Whale Alerts | Volume Tracking | Top Holders\n')
+    print('📊 Features: Whale Alerts | Volume | Top 20 | First-Timers\n')
     
     # Start daily summary task
     asyncio.create_task(send_daily_summary())
