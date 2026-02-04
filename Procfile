@@ -1,1 +1,1 @@
-worker: python bot_router.py
+worker: python bot.py
