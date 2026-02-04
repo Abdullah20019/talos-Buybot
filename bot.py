@@ -12,7 +12,7 @@ CHAT_ID = os.getenv('CHAT_ID')
 ARB_RPC_URL = os.getenv('ARB_RPC_URL')
 
 # TALOS Contract on Arbitrum
-TALOS_ADDRESS = "0x7f5C764cBc14f9669B88837ca1490cCa17c31607"
+TALOS_ADDRESS = "0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9"
 w3 = Web3(Web3.HTTPProvider(ARB_RPC_URL))
 
 # Swap event signature
