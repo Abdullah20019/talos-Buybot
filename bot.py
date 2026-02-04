@@ -1,4 +1,4 @@
-# Updated: Feb 4, 2026 - Enhanced with first-time buyers & whale tracking
+# Updated: Feb 4, 2026 - Enhanced with first-time buyers & whale tracking + 40K sell minimum
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -31,6 +31,10 @@ WETH_ADDRESS = '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
 
 # Whale alert threshold (WETH)
 WHALE_THRESHOLD = 0.3  # 0.3 ETH
+
+# Minimum trade amounts to track
+MIN_BUY_AMOUNT = 10        # Minimum TALOS for buy notifications
+MIN_SELL_AMOUNT = 40000    # Minimum TALOS for sell notifications
 
 # Known whale/project wallets (add addresses here)
 KNOWN_WALLETS = {
@@ -347,7 +351,10 @@ async def ping(update, context):
         f'🤖 Monitoring {TOKEN_SYMBOL} swaps!\n\n'
         f'👥 Tracked wallets: {total_wallets}\n'
         f'🆕 First-time buyers: {new_buyers}\n'
-        f'👑 Top 20 tracked: {len(top_20_holders)}'
+        f'👑 Top 20 tracked: {len(top_20_holders)}\n\n'
+        f'📊 Minimums:\n'
+        f'  • Buys: ≥{MIN_BUY_AMOUNT} {TOKEN_SYMBOL}\n'
+        f'  • Sells: ≥{MIN_SELL_AMOUNT:,} {TOKEN_SYMBOL}'
     )
 
 async def volume_command(update, context):
@@ -442,9 +449,7 @@ async def handle_transfer(event):
             value = transfer['args']['value']
             talos_amount = value / (10 ** TOKEN_DECIMALS)
             
-            if talos_amount < 10:
-                continue
-            
+            # Determine swap type first
             swap_type = None
             user_wallet = None
             
@@ -466,6 +471,14 @@ async def handle_transfer(event):
                     user_wallet = tx_from
             
             if not swap_type or not user_wallet:
+                continue
+            
+            # Apply different minimums for buys and sells
+            if swap_type == "BUY" and talos_amount < MIN_BUY_AMOUNT:
+                print(f"⏭️ Skipping small buy: {talos_amount:.1f} TALOS")
+                continue
+            elif swap_type == "SELL" and talos_amount < MIN_SELL_AMOUNT:
+                print(f"⏭️ Skipping small sell: {talos_amount:.1f} TALOS (min: {MIN_SELL_AMOUNT:,})")
                 continue
             
             # Calculate WETH amount
@@ -629,7 +642,8 @@ async def watch_token_transfers():
     contract = w3.eth.contract(address=TOKEN_ADDRESS, abi=transfer_abi)
     print(f'✅ Monitoring {TOKEN_SYMBOL} Swaps')
     print(f'   Token: {TOKEN_ADDRESS}')
-    print(f'   Min: 10 {TOKEN_SYMBOL}')
+    print(f'   Min Buy: {MIN_BUY_AMOUNT} {TOKEN_SYMBOL}')
+    print(f'   Min Sell: {MIN_SELL_AMOUNT:,} {TOKEN_SYMBOL}')
     print(f'   Whale Alert: ≥{WHALE_THRESHOLD} ETH')
     
     if os.path.exists(LOGO_PATH):
