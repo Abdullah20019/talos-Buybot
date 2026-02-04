@@ -1,4 +1,4 @@
-# Updated: Feb 4, 2026 - Enhanced with first-time buyers & whale tracking + 40K sell minimum
+# Updated: Feb 4, 2026 - Fixed sell minimum filtering (40K TALOS)
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -449,7 +449,11 @@ async def handle_transfer(event):
             value = transfer['args']['value']
             talos_amount = value / (10 ** TOKEN_DECIMALS)
             
-            # Determine swap type first
+            # Skip dust amounts
+            if talos_amount < 1:
+                continue
+            
+            # STEP 1: Determine swap type FIRST before any filtering
             swap_type = None
             user_wallet = None
             
@@ -470,16 +474,22 @@ async def handle_transfer(event):
                     swap_type = "SELL"
                     user_wallet = tx_from
             
+            # Skip if we can't determine swap type
             if not swap_type or not user_wallet:
                 continue
             
-            # Apply different minimums for buys and sells
-            if swap_type == "BUY" and talos_amount < MIN_BUY_AMOUNT:
-                print(f"⏭️ Skipping small buy: {talos_amount:.1f} TALOS")
-                continue
-            elif swap_type == "SELL" and talos_amount < MIN_SELL_AMOUNT:
-                print(f"⏭️ Skipping small sell: {talos_amount:.1f} TALOS (min: {MIN_SELL_AMOUNT:,})")
-                continue
+            # STEP 2: NOW check minimum amounts based on type
+            if swap_type == "BUY":
+                if talos_amount < MIN_BUY_AMOUNT:
+                    print(f"⏭️ Skipping small BUY: {talos_amount:.1f} TALOS (min: {MIN_BUY_AMOUNT})")
+                    continue
+            elif swap_type == "SELL":
+                if talos_amount < MIN_SELL_AMOUNT:
+                    print(f"⏭️ Skipping small SELL: {talos_amount:,.1f} TALOS (min: {MIN_SELL_AMOUNT:,})")
+                    continue
+            
+            # If we get here, the swap meets the minimum requirements
+            print(f"✅ Processing {swap_type}: {talos_amount:,.1f} TALOS")
             
             # Calculate WETH amount
             weth_amount = 0
