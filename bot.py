@@ -1,4 +1,4 @@
-# Updated: Feb 4, 2026 - Force redeploy
+# Updated: Feb 4, 2026 - Force redeploy v2
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -595,7 +595,7 @@ async def watch_token_transfers():
     while True:
         try:
             if event_filter is None:
-                event_filter = contract.events.Transfer.create_filter(from_block='latest')
+                event_filter = contract.events.Transfer.create_filter(fromBlock='latest')  # FIXED: Changed from_block to fromBlock
                 if retry_count > 0:
                     print(f'✅ Reconnected')
                 retry_count = 0
