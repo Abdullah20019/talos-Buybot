@@ -1,0 +1,21 @@
+# Environment variables (sensitive data)
+.env
+file.env
+*.env.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Images (optional - remove if you want to upload logo)
+image.jpg
+logo.jpg
+
+# OS files
+.DS_Store
+Thumbs.db
