@@ -1,3 +1,4 @@
+# Updated: Feb 4, 2026 - Force redeploy
 import os
 import asyncio
 from dotenv import load_dotenv
