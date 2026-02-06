@@ -20,9 +20,7 @@ WETH_ADDRESS = os.getenv("WETH_ADDRESS")
 if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS):
     raise RuntimeError("Missing one or more required env vars")
 
-# Clean RPC URL
 ARB_RPC_URL = ARB_RPC_URL.strip()
-
 print(f"Using RPC endpoint: {ARB_RPC_URL}")
 
 TOKEN_ADDRESS = Web3.to_checksum_address(TOKEN_ADDRESS)
@@ -68,7 +66,7 @@ weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=ERC20_ABI)
 try:
     TALOS_DECIMALS = talos_contract.functions.decimals().call()
 except Exception:
-    TALOS_DECIMALS = 18  # safe fallback
+    TALOS_DECIMALS = 18
 
 TALOS_FACTOR = 10 ** TALOS_DECIMALS
 
@@ -76,7 +74,6 @@ DEXSCREENER_URL = (
     "https://api.dexscreener.com/latest/dex/tokens/" + os.getenv("TOKEN_ADDRESS")
 )
 
-# Common Arbitrum routers / aggregators
 ROUTERS = {
     Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),  # Camelot
     Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),  # Uniswap v3
@@ -236,7 +233,10 @@ async def watch_talos_transfers(application: Application):
         print(f"Error getting initial block number: {e}")
         return
 
-    MAX_RANGE = 500  # max 500 blocks per call
+    MAX_RANGE = 250  # keep ranges small
+
+    # topic0 = keccak of Transfer(address,address,uint256)
+    transfer_topic = talos_contract.events.Transfer().abi["signature"]
 
     while True:
         try:
@@ -249,12 +249,16 @@ async def watch_talos_transfers(application: Application):
                     upper = min(from_block + MAX_RANGE - 1, to_block)
 
                     try:
-                        # FILTERED BY TALOS ADDRESS TO AVOID HUGE RESPONSES
-                        events = talos_contract.events.Transfer().get_logs(
-                            fromBlock=from_block,
-                            toBlock=upper,
-                            address=TOKEN_ADDRESS
-                        )
+                        raw_logs = w3.eth.get_logs({
+                            "fromBlock": from_block,
+                            "toBlock": upper,
+                            "address": TOKEN_ADDRESS,
+                            "topics": [transfer_topic]
+                        })
+                        events = [
+                            talos_contract.events.Transfer().process_log(log)
+                            for log in raw_logs
+                        ]
                     except Exception as e:
                         print(
                             f"get_logs error for range {from_block}-{upper}: {e}"
