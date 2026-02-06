@@ -14,8 +14,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ARB_RPC_URL = os.getenv("ARB_RPC_URL")
 
-# This must be 0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9 for your use-case
-TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")
+TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")  # should be 0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9
 WETH_ADDRESS = os.getenv("WETH_ADDRESS")
 
 if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS):
@@ -66,7 +65,9 @@ weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=ERC20_ABI)
 # Read decimals once
 try:
     TALOS_DECIMALS = talos_contract.functions.decimals().call()
-except Exception:
+    print(f"TALOS_DECIMALS = {TALOS_DECIMALS}")
+except Exception as e:
+    print(f"Error reading decimals, defaulting to 18: {e}")
     TALOS_DECIMALS = 18
 
 TALOS_FACTOR = 10 ** TALOS_DECIMALS
@@ -75,6 +76,7 @@ DEXSCREENER_URL = (
     "https://api.dexscreener.com/latest/dex/tokens/" + os.getenv("TOKEN_ADDRESS")
 )
 
+# Routers you care about (check against Dexscreener / Arbiscan for this token)
 ROUTERS = {
     Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),  # Camelot
     Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),  # Uniswap v3
@@ -82,9 +84,15 @@ ROUTERS = {
     Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),  # 1inch
     Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA")   # OpenOcean
 }
+print("Tracking routers:")
+for r in ROUTERS:
+    print(" -", r)
 
 def is_router(addr: str) -> bool:
-    return Web3.to_checksum_address(addr) in ROUTERS
+    try:
+        return Web3.to_checksum_address(addr) in ROUTERS
+    except Exception:
+        return False
 
 # DexScreener cache (15s)
 _price_cache_ts = 0.0
@@ -104,6 +112,7 @@ async def get_live_stats():
 
         pairs = data.get("pairs", [])
         if not pairs:
+            print("DexScreener: no pairs found for token")
             return None, None, None
 
         p = pairs[0]
@@ -151,12 +160,16 @@ async def handle_transfer_event(ev, application: Application):
 
         talos_amount = raw_value / TALOS_FACTOR
         if talos_amount == 0:
+            print("Skip event: amount is zero")
             return
 
         tx_hash = ev["transactionHash"].hex()
 
         from_is_router = is_router(from_addr)
         to_is_router = is_router(to_addr)
+
+        print(f"Transfer event: from={from_addr} (router={from_is_router}) "
+              f"to={to_addr} (router={to_is_router}) amount={talos_amount}")
 
         if from_is_router and not to_is_router:
             swap_type = "🟢 BUY"
@@ -165,6 +178,8 @@ async def handle_transfer_event(ev, application: Application):
             swap_type = "🔴 SELL"
             trader = from_addr
         else:
+            # Not a router<->user swap; ignore
+            print("Skip event: not router <-> user trade")
             return
 
         try:
@@ -218,7 +233,7 @@ async def handle_transfer_event(ev, application: Application):
             f"🔗 Txn: https://arbiscan.io/tx/{tx_hash}"
         )
 
-        print(msg.replace("\n", " | "))
+        print("Sending Telegram message:", msg.replace("\n", " | "))
         await application.bot.send_message(chat_id=CHAT_ID, text=msg)
 
     except Exception as e:
@@ -242,6 +257,7 @@ async def watch_talos_transfers(application: Application):
         text="Transfer(address,address,uint256)"
     ).hex()
     transfer_topic = TRANSFER_EVENT_TOPIC
+    print("Using Transfer topic:", transfer_topic)
 
     while True:
         try:
@@ -252,6 +268,7 @@ async def watch_talos_transfers(application: Application):
 
                 while from_block <= to_block:
                     upper = min(from_block + MAX_RANGE - 1, to_block)
+                    print(f"Querying logs from {from_block} to {upper}...")
 
                     try:
                         raw_logs = w3.eth.get_logs({
@@ -260,6 +277,7 @@ async def watch_talos_transfers(application: Application):
                             "address": TOKEN_ADDRESS,
                             "topics": [transfer_topic]
                         })
+                        print(f"Found {len(raw_logs)} raw logs in range {from_block}-{upper}")
                         events = [
                             talos_contract.events.Transfer().process_log(log)
                             for log in raw_logs
