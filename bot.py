@@ -325,20 +325,24 @@ async def handle_transfer_event(ev, application: Application):
 
         print("Preparing Telegram media send. USD value:", usd_value)
 
-        # ---------- Media rules ----------
-        # 1) Mega whale (>= 500 USD): 500$ video (only relevant once BUY/SELL mins passed)
+        # ---------- Media rules with safe 500$ fallback ----------
+        # 1) Mega whale (>= 500 USD): try 500$ video first
         if usd_value >= MEGA_WHALE_USD and os.path.exists(BUYORSELL_500_VIDEO_PATH):
-            print("Sending 500$BuyorSell mega-whale video")
-            with open(BUYORSELL_500_VIDEO_PATH, "rb") as f:
-                await application.bot.send_video(
-                    chat_id=CHAT_ID,
-                    video=f,
-                    caption=msg,
-                    parse_mode=ParseMode.MARKDOWN
-                )
+            try:
+                print("Sending 500$BuyorSell mega-whale video")
+                with open(BUYORSELL_500_VIDEO_PATH, "rb") as f:
+                    await application.bot.send_video(
+                        chat_id=CHAT_ID,
+                        video=f,
+                        caption=msg,
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                return
+            except Exception as e:
+                print(f"500$ video failed, falling back to 100$ logic: {e}")
 
-        # 2) 100–499 USD BUY: 100$Buy video (only for buys, and buys are already ≥100)
-        elif swap_type == "🟢 BUY" and usd_value >= MINI_WHALE_USD and os.path.exists(BUY_100_VIDEO_PATH):
+        # 2) BUY >= 100 USD: 100$Buy video
+        if swap_type == "🟢 BUY" and usd_value >= MINI_WHALE_USD and os.path.exists(BUY_100_VIDEO_PATH):
             print("Sending 100$Buy mini-whale BUY video")
             with open(BUY_100_VIDEO_PATH, "rb") as f:
                 await application.bot.send_video(
@@ -347,9 +351,10 @@ async def handle_transfer_event(ev, application: Application):
                     caption=msg,
                     parse_mode=ParseMode.MARKDOWN
                 )
+            return
 
-        # 3) 100–499 USD SELL: 100$sell video, but only for sells that are >= 3000
-        elif swap_type == "🔴 SELL" and usd_value >= max(MINI_WHALE_USD, SELL_MIN_USD) and os.path.exists(SELL_100_VIDEO_PATH):
+        # 3) SELL >= max(100, SELL_MIN_USD): 100$sell video (so only ≥3000)
+        if swap_type == "🔴 SELL" and usd_value >= max(MINI_WHALE_USD, SELL_MIN_USD) and os.path.exists(SELL_100_VIDEO_PATH):
             print("Sending 100$sell SELL video (>=3000)")
             with open(SELL_100_VIDEO_PATH, "rb") as f:
                 await application.bot.send_video(
@@ -358,9 +363,10 @@ async def handle_transfer_event(ev, application: Application):
                     caption=msg,
                     parse_mode=ParseMode.MARKDOWN
                 )
+            return
 
-        # 4) Smaller trades that passed min (BUY ≥100, SELL ≥3000): image
-        elif os.path.exists(IMAGE_PATH):
+        # 4) Anything that passed min but no video: image
+        if os.path.exists(IMAGE_PATH):
             print("Sending image alert")
             with open(IMAGE_PATH, "rb") as f:
                 await application.bot.send_photo(
@@ -369,8 +375,6 @@ async def handle_transfer_event(ev, application: Application):
                     caption=msg,
                     parse_mode=ParseMode.MARKDOWN
                 )
-
-        # 5) Fallback: text only
         else:
             print("Media files not found, sending text only")
             await application.bot.send_message(
