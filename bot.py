@@ -14,6 +14,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ARB_RPC_URL = os.getenv("ARB_RPC_URL")
 
+# This must be 0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9 for your use-case
 TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")
 WETH_ADDRESS = os.getenv("WETH_ADDRESS")
 
@@ -233,7 +234,8 @@ async def watch_talos_transfers(application: Application):
         print(f"Error getting initial block number: {e}")
         return
 
-    MAX_RANGE = 250  # keep ranges small
+    # Small range to avoid QuickNode 413 Request Entity Too Large
+    MAX_RANGE = 5
 
     # topic0 = keccak of Transfer(address,address,uint256)
     TRANSFER_EVENT_TOPIC = Web3.keccak(
