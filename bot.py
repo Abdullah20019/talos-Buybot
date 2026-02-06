@@ -19,7 +19,7 @@ WETH_ADDRESS = Web3.to_checksum_address(os.getenv("WETH_ADDRESS"))
 
 w3 = Web3(Web3.HTTPProvider(ARB_RPC_URL))
 
-# Load pool ABI (v3 style Swap event with amount0, amount1, token0, token1 functions)
+# Load pool ABI
 with open("abi/pool.json", "r") as f:
     pool_abi = json.load(f)
 
@@ -65,7 +65,7 @@ async def fetch_dexscreener_pairs():
             if TOKEN_ADDRESS.lower() not in (base_addr, quote_addr):
                 continue
 
-            dex_id = p.get("dexId", "DEX").upper()
+            dex_id = (p.get("dexId") or "DEX").upper()
             name = f"{dex_id} ({idx})"
             POOLS[name] = Web3.to_checksum_address(pair_address)
             idx += 1
@@ -94,7 +94,7 @@ async def get_live_stats():
 
         p = pairs[0]
         price_usd = float(p.get("priceUsd", 0) or 0)
-        fdv = float(p.get("fdv", 0) or 0)  # use FDV as market cap approximation
+        fdv = float(p.get("fdv", 0) or 0)
         dex_name = (p.get("dexId") or "DEX").upper()
 
         if price_usd <= 0:
@@ -163,11 +163,9 @@ async def handle_swap_event(event, pool_name):
         talos_amount = abs(talos_delta) / 1e18
         weth_amount = abs(weth_delta) / 1e18
 
-        # Ignore dust / weird events
         if talos_amount == 0:
             return
 
-        # Classify buy or sell based on TALOS sign
         if talos_delta > 0:
             swap_type = "🔴 SELL"
         elif talos_delta < 0:
@@ -175,7 +173,6 @@ async def handle_swap_event(event, pool_name):
         else:
             swap_type = "⚪️ SWAP"
 
-        # Live price + market cap
         price_usd, mcap, dex_name = await get_live_stats()
 
         if price_usd:
@@ -195,7 +192,6 @@ async def handle_swap_event(event, pool_name):
         robots_row = robots_for_usd(usd_value)
 
         tx_hash = event["transactionHash"].hex()
-
         title_name = dex_name or pool_name
 
         msg = (
@@ -231,8 +227,9 @@ async def watch_pool(pool_address, pool_name):
     while True:
         try:
             if event_filter is None:
-                event_filter = contract.events.Swap.create_filter(
-                    from_block="latest"
+                # FIXED: correct filter syntax for Web3
+                event_filter = contract.events.Swap().create_filter(
+                    fromBlock="latest"
                 )
 
             if retry_count > 0:
@@ -255,20 +252,17 @@ async def watch_pool(pool_address, pool_name):
 async def main():
     print("🚀 Starting TALOS Buy Bot...\n")
 
-    # 1) Load all pools from DexScreener
     await fetch_dexscreener_pairs()
     if not POOLS:
         print("No TALOS pools loaded from DexScreener. Exiting.")
         return
 
-    # 2) Setup Telegram bot
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("ping", ping))
 
     await application.initialize()
     await application.start()
 
-    # 3) Start watchers for all pools
     tasks = []
     for name, addr in POOLS.items():
         tasks.append(asyncio.create_task(watch_pool(addr, name)))
