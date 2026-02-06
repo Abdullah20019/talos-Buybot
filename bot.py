@@ -150,6 +150,17 @@ def robots_for_usd(usd: float) -> str:
 async def ping(update, context):
     await update.message.reply_text("Bot is alive ✅")
 
+# ---------- Media config ----------
+IMAGE_PATH = "newimage.jpeg"
+
+BUY_100_VIDEO_PATH = "100$Buy.mp4"
+SELL_100_VIDEO_PATH = "100$sell.mp4"
+BUYORSELL_500_VIDEO_PATH = "500$BuyorSell.mp4"
+
+MINI_WHALE_USD = 100    # ≥100 USD trades
+MEGA_WHALE_USD = 500    # ≥500 USD trades
+# -------------------------------
+
 async def handle_transfer_event(ev, application: Application):
     try:
         args = ev["args"]
@@ -205,6 +216,7 @@ async def handle_transfer_event(ev, application: Application):
                 except Exception:
                     continue
 
+        # Price + FDV
         price_usd, fdv, dex_name = await get_live_stats()
         if price_usd:
             usd_value = talos_amount * price_usd
@@ -235,8 +247,53 @@ async def handle_transfer_event(ev, application: Application):
             f"🔗 Txn: https://arbiscan.io/tx/{tx_hash}"
         )
 
-        print("Sending Telegram message:", msg.replace("\n", " | "))
-        await application.bot.send_message(chat_id=CHAT_ID, text=msg)
+        print("Preparing Telegram media send. USD value:", usd_value)
+
+        # ---------- Media rules ----------
+        # 1) Mega whale (>= 500 USD): use 500$BuyorSell video for both buys & sells
+        if usd_value >= MEGA_WHALE_USD and os.path.exists(BUYORSELL_500_VIDEO_PATH):
+            print("Sending 500$BuyorSell mega-whale video")
+            with open(BUYORSELL_500_VIDEO_PATH, "rb") as f:
+                await application.bot.send_video(
+                    chat_id=CHAT_ID,
+                    video=f,
+                    caption=msg
+                )
+
+        # 2) 100–499 USD BUY: use 100$Buy video
+        elif usd_value >= MINI_WHALE_USD and swap_type == "🟢 BUY" and os.path.exists(BUY_100_VIDEO_PATH):
+            print("Sending 100$Buy mini-whale BUY video")
+            with open(BUY_100_VIDEO_PATH, "rb") as f:
+                await application.bot.send_video(
+                    chat_id=CHAT_ID,
+                    video=f,
+                    caption=msg
+                )
+
+        # 3) 100–499 USD SELL: use 100$sell video
+        elif usd_value >= MINI_WHALE_USD and swap_type == "🔴 SELL" and os.path.exists(SELL_100_VIDEO_PATH):
+            print("Sending 100$sell mini-whale SELL video")
+            with open(SELL_100_VIDEO_PATH, "rb") as f:
+                await application.bot.send_video(
+                    chat_id=CHAT_ID,
+                    video=f,
+                    caption=msg
+                )
+
+        # 4) Smaller trades: send static image
+        elif os.path.exists(IMAGE_PATH):
+            print("Sending image alert")
+            with open(IMAGE_PATH, "rb") as f:
+                await application.bot.send_photo(
+                    chat_id=CHAT_ID,
+                    photo=f,
+                    caption=msg
+                )
+
+        # 5) Fallback: text only
+        else:
+            print("Media files not found, sending text only")
+            await application.bot.send_message(chat_id=CHAT_ID, text=msg)
 
     except Exception as e:
         print(f"Error handling transfer event: {e}")
