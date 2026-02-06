@@ -43,11 +43,36 @@ DEX_NAME_BY_LP = {
     CAMELOT_LP: "Camelot",
 }
 
+# Known router/aggregator contracts that can route TALOS trades on Arbitrum
+ROUTER_ADDRESSES = {
+    # Camelot router
+    Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),
+    # Uniswap v3 routers
+    Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),
+    Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"),  # Router2[web:174]
+    # Odos
+    Web3.to_checksum_address("0x19cEeAd7105607Cd444F5ad10dd51356436095a1"),
+    # 1inch aggregation router (V4/V6 commonly used on Arbitrum)[web:158][web:171]
+    Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),
+    Web3.to_checksum_address("0x111111125421CA6dc452d289314280a0f8842A65"),
+    # OpenOcean
+    Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA"),
+    # SushiSwap router v2 on Arbitrum[web:73]
+    Web3.to_checksum_address("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"),
+    # TraderJoe router on Arbitrum[web:73]
+    Web3.to_checksum_address("0xbeE5c10Cf6E4F68f831E11C1D9E59B43560B3642"),
+    # OKX DEX Router (used by Jumper)[web:148]
+    Web3.to_checksum_address("0x01D8EDB8eF96119d6Bada3F50463DeE6fe863B4C"),
+}
+
 print(f"TOKEN_ADDRESS  = {TOKEN_ADDRESS}")
 print(f"WETH_ADDRESS   = {WETH_ADDRESS}")
 print("LP_ADDRESSES:")
 for lp in LP_ADDRESSES:
     print(" -", lp)
+print("ROUTER_ADDRESSES:")
+for r in ROUTER_ADDRESSES:
+    print(" -", r)
 
 w3 = Web3(HTTPProvider(ARB_RPC_URL))
 
@@ -163,7 +188,7 @@ BUY_100_VIDEO_PATH = "100$Buy.mp4"
 SELL_100_VIDEO_PATH = "100$sell.mp4"
 BUYORSELL_500_VIDEO_PATH = "500$BuyorSell.mp4"
 
-MIN_ALERT_USD = 50     # minimum trade size to alert
+MIN_ALERT_USD = 1      # minimum trade size to alert (now $1)
 MINI_WHALE_USD = 100   # ≥100 USD trades -> 100$ videos
 MEGA_WHALE_USD = 500   # ≥500 USD trades -> 500$ video
 # -------------------------------
@@ -184,7 +209,10 @@ async def handle_transfer_event(ev, application: Application):
         from_is_lp = from_addr.lower() in {a.lower() for a in LP_ADDRESSES}
         to_is_lp = to_addr.lower() in {a.lower() for a in LP_ADDRESSES}
 
-        # Which LP (and thus which DEX) was used
+        from_is_router = from_addr.lower() in {a.lower() for a in ROUTER_ADDRESSES}
+        to_is_router = to_addr.lower() in {a.lower() for a in ROUTER_ADDRESSES}
+
+        # Identify which LP (if any) is involved, to label DEX
         lp_used = None
         if from_is_lp:
             lp_used = next(a for a in LP_ADDRESSES if a.lower() == from_addr.lower())
@@ -194,20 +222,25 @@ async def handle_transfer_event(ev, application: Application):
         dex_name_local = DEX_NAME_BY_LP.get(lp_used, "DEX")
 
         print(
-            f"Transfer event: from={from_addr} (lp={from_is_lp}) "
-            f"to={to_addr} (lp={to_is_lp}) amount={talos_amount} dex={dex_name_local}"
+            f"Transfer event: from={from_addr} (lp={from_is_lp}, router={from_is_router}) "
+            f"to={to_addr} (lp={to_is_lp}, router={to_is_router}) "
+            f"amount={talos_amount} dex={dex_name_local}"
         )
 
-        # BUY: LP -> user
-        if from_is_lp and not to_is_lp:
+        # Treat LP or router side as "DEX side"
+        from_is_dex_side = from_is_lp or from_is_router
+        to_is_dex_side = to_is_lp or to_is_router
+
+        # BUY: DEX side -> user
+        if from_is_dex_side and not to_is_dex_side:
             swap_type = "🟢 BUY"
             trader = to_addr
-        # SELL: user -> LP
-        elif to_is_lp and not from_is_lp:
+        # SELL: user -> DEX side
+        elif to_is_dex_side and not from_is_dex_side:
             swap_type = "🔴 SELL"
             trader = from_addr
         else:
-            # wallet↔wallet, LP↔LP, etc. -> ignore
+            # wallet↔wallet, DEX↔DEX, etc. -> ignore
             return
 
         # Try to get WETH amount from receipt
@@ -219,6 +252,9 @@ async def handle_transfer_event(ev, application: Application):
 
         weth_amount = 0.0
         if receipt is not None:
+            total_weth_in_tx = 0.0
+            matched_for_trader = False
+
             for log in receipt.logs:
                 if log["address"].lower() != WETH_ADDRESS.lower():
                     continue
@@ -226,11 +262,19 @@ async def handle_transfer_event(ev, application: Application):
                     we = weth_contract.events.Transfer().process_log(log)
                     f = we["args"]["from"]
                     t = we["args"]["to"]
-                    if f.lower() == trader.lower() or t.lower() == trader.lower():
-                        weth_amount = we["args"]["value"] / 1e18
-                        break
+                    value_eth = we["args"]["value"] / 1e18
+                    total_weth_in_tx += value_eth
+
+                    # Prefer WETH directly involving trader if present
+                    if (f.lower() == trader.lower() or t.lower() == trader.lower()) and not matched_for_trader:
+                        weth_amount = value_eth
+                        matched_for_trader = True
                 except Exception:
                     continue
+
+            # If no direct trader match, fall back to total WETH volume in tx
+            if not matched_for_trader and total_weth_in_tx > 0:
+                weth_amount = total_weth_in_tx
 
         # Price + FDV
         price_usd, fdv, _dex_from_api = await get_live_stats()
@@ -312,7 +356,7 @@ async def handle_transfer_event(ev, application: Application):
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-        # 4) Smaller trades (but ≥ 50 USD): send static image
+        # 4) Smaller trades (but ≥ MIN_ALERT_USD): send static image
         elif os.path.exists(IMAGE_PATH):
             print("Sending image alert")
             with open(IMAGE_PATH, "rb") as f:
@@ -336,7 +380,7 @@ async def handle_transfer_event(ev, application: Application):
         print(f"Error handling transfer event: {e}")
 
 async def watch_talos_transfers(application: Application):
-    print("✅ Watching TALOS LP-based buys/sells on Arbitrum…")
+    print("✅ Watching TALOS LP/router-based buys/sells on Arbitrum…")
 
     try:
         last_block = w3.eth.block_number
