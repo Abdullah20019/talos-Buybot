@@ -6,6 +6,7 @@ import aiohttp
 
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler
+from telegram.constants import ParseMode
 from web3 import Web3, HTTPProvider
 
 # Load env vars if a .env file exists (safe to call even if not present)
@@ -36,6 +37,11 @@ UNISWAP_LP = Web3.to_checksum_address(UNISWAP_LP)
 CAMELOT_LP = Web3.to_checksum_address(CAMELOT_LP)
 
 LP_ADDRESSES = {UNISWAP_LP, CAMELOT_LP}
+
+DEX_NAME_BY_LP = {
+    UNISWAP_LP: "Uniswap",
+    CAMELOT_LP: "Camelot",
+}
 
 print(f"TOKEN_ADDRESS  = {TOKEN_ADDRESS}")
 print(f"WETH_ADDRESS   = {WETH_ADDRESS}")
@@ -157,8 +163,9 @@ BUY_100_VIDEO_PATH = "100$Buy.mp4"
 SELL_100_VIDEO_PATH = "100$sell.mp4"
 BUYORSELL_500_VIDEO_PATH = "500$BuyorSell.mp4"
 
-MINI_WHALE_USD = 100    # ≥100 USD trades
-MEGA_WHALE_USD = 500    # ≥500 USD trades
+MIN_ALERT_USD = 50     # minimum trade size to alert
+MINI_WHALE_USD = 100   # ≥100 USD trades -> 100$ videos
+MEGA_WHALE_USD = 500   # ≥500 USD trades -> 500$ video
 # -------------------------------
 
 async def handle_transfer_event(ev, application: Application):
@@ -177,9 +184,18 @@ async def handle_transfer_event(ev, application: Application):
         from_is_lp = from_addr.lower() in {a.lower() for a in LP_ADDRESSES}
         to_is_lp = to_addr.lower() in {a.lower() for a in LP_ADDRESSES}
 
+        # Which LP (and thus which DEX) was used
+        lp_used = None
+        if from_is_lp:
+            lp_used = next(a for a in LP_ADDRESSES if a.lower() == from_addr.lower())
+        elif to_is_lp:
+            lp_used = next(a for a in LP_ADDRESSES if a.lower() == to_addr.lower())
+
+        dex_name_local = DEX_NAME_BY_LP.get(lp_used, "DEX")
+
         print(
             f"Transfer event: from={from_addr} (lp={from_is_lp}) "
-            f"to={to_addr} (lp={to_is_lp}) amount={talos_amount}"
+            f"to={to_addr} (lp={to_is_lp}) amount={talos_amount} dex={dex_name_local}"
         )
 
         # BUY: LP -> user
@@ -217,7 +233,7 @@ async def handle_transfer_event(ev, application: Application):
                     continue
 
         # Price + FDV
-        price_usd, fdv, dex_name = await get_live_stats()
+        price_usd, fdv, _dex_from_api = await get_live_stats()
         if price_usd:
             usd_value = talos_amount * price_usd
             value_line = f"💵 Value: ${usd_value:,.2f}"
@@ -227,6 +243,11 @@ async def handle_transfer_event(ev, application: Application):
             value_line = "💵 Value: N/A"
             price_line = "💲 Price: N/A"
 
+        # Minimum alert filter
+        if usd_value < MIN_ALERT_USD:
+            print(f"Skip trade below min alert size: ${usd_value:.2f}")
+            return
+
         if fdv:
             fdv_line = f"🏦 FDV: ${fdv:,.1f}"
         else:
@@ -234,17 +255,25 @@ async def handle_transfer_event(ev, application: Application):
 
         robots_row = robots_for_usd(usd_value)
 
+        # Clickable links (Markdown)
+        tx_url = f"https://arbiscan.io/tx/{tx_hash}"
+        trader_url = f"https://arbiscan.io/address/{trader}"
+
+        trader_short = f"{trader[:6]}...{trader[-4:]}"
+        trader_md = f"[{trader_short}]({trader_url})"
+        tx_md = f"[Txn]({tx_url})"
+
         msg = (
             f"$TALOS {swap_type}! 🛒\n"
-            f"{dex_name or 'DEX'} Swap\n"
+            f"{dex_name_local} Swap\n"
             f"{robots_row}\n\n"
             f"💰 TALOS: {talos_amount:,.2f}\n"
             f"💎 WETH: {weth_amount:.4f}\n"
             f"{value_line}\n"
             f"{price_line}\n"
             f"{fdv_line}\n"
-            f"👤 Trader: {trader[:6]}...{trader[-4:]}\n"
-            f"🔗 Txn: https://arbiscan.io/tx/{tx_hash}"
+            f"👤 Trader: {trader_md}\n"
+            f"🔗 {tx_md}"
         )
 
         print("Preparing Telegram media send. USD value:", usd_value)
@@ -257,7 +286,8 @@ async def handle_transfer_event(ev, application: Application):
                 await application.bot.send_video(
                     chat_id=CHAT_ID,
                     video=f,
-                    caption=msg
+                    caption=msg,
+                    parse_mode=ParseMode.MARKDOWN
                 )
 
         # 2) 100–499 USD BUY: use 100$Buy video
@@ -267,7 +297,8 @@ async def handle_transfer_event(ev, application: Application):
                 await application.bot.send_video(
                     chat_id=CHAT_ID,
                     video=f,
-                    caption=msg
+                    caption=msg,
+                    parse_mode=ParseMode.MARKDOWN
                 )
 
         # 3) 100–499 USD SELL: use 100$sell video
@@ -277,23 +308,29 @@ async def handle_transfer_event(ev, application: Application):
                 await application.bot.send_video(
                     chat_id=CHAT_ID,
                     video=f,
-                    caption=msg
+                    caption=msg,
+                    parse_mode=ParseMode.MARKDOWN
                 )
 
-        # 4) Smaller trades: send static image
+        # 4) Smaller trades (but ≥ 50 USD): send static image
         elif os.path.exists(IMAGE_PATH):
             print("Sending image alert")
             with open(IMAGE_PATH, "rb") as f:
                 await application.bot.send_photo(
                     chat_id=CHAT_ID,
                     photo=f,
-                    caption=msg
+                    caption=msg,
+                    parse_mode=ParseMode.MARKDOWN
                 )
 
         # 5) Fallback: text only
         else:
             print("Media files not found, sending text only")
-            await application.bot.send_message(chat_id=CHAT_ID, text=msg)
+            await application.bot.send_message(
+                chat_id=CHAT_ID,
+                text=msg,
+                parse_mode=ParseMode.MARKDOWN
+            )
 
     except Exception as e:
         print(f"Error handling transfer event: {e}")
