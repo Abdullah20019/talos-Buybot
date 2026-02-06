@@ -6,7 +6,7 @@ import aiohttp
 
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler
-from web3 import Web3
+from web3 import Web3, HTTPProvider
 
 load_dotenv()
 
@@ -20,10 +20,22 @@ WETH_ADDRESS = os.getenv("WETH_ADDRESS")
 if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS):
     raise RuntimeError("Missing one or more required env vars")
 
+# Clean RPC URL
+ARB_RPC_URL = ARB_RPC_URL.strip()
+
+print(f"Using RPC endpoint: {ARB_RPC_URL}")
+
 TOKEN_ADDRESS = Web3.to_checksum_address(TOKEN_ADDRESS)
 WETH_ADDRESS = Web3.to_checksum_address(WETH_ADDRESS)
 
-w3 = Web3(Web3.HTTPProvider(ARB_RPC_URL))
+w3 = Web3(HTTPProvider(ARB_RPC_URL))
+
+# Connectivity test
+try:
+    chain_id = w3.eth.chain_id
+    print(f"Connected to chain id: {chain_id}")
+except Exception as e:
+    raise RuntimeError(f"Failed to connect to RPC: {e}")
 
 # --- Minimal ERC20 ABI (Transfer + decimals) ---
 ERC20_ABI = json.loads("""
@@ -64,7 +76,7 @@ DEXSCREENER_URL = (
     "https://api.dexscreener.com/latest/dex/tokens/" + os.getenv("TOKEN_ADDRESS")
 )
 
-# Common Arbitrum routers / aggregators (extend over time)
+# Common Arbitrum routers / aggregators
 ROUTERS = {
     Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),  # Camelot
     Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),  # Uniswap v3
@@ -76,14 +88,11 @@ ROUTERS = {
 def is_router(addr: str) -> bool:
     return Web3.to_checksum_address(addr) in ROUTERS
 
-# --- DexScreener cache (to avoid rate limits) ---
+# DexScreener cache (15s)
 _price_cache_ts = 0.0
 _price_cache = None  # (price_usd, fdv, dex_name)
 
 async def get_live_stats():
-    """
-    Returns (price_usd, fdv, dex_name) with 15s cache. [web:219]
-    """
     global _price_cache_ts, _price_cache
 
     now = time.time()
@@ -148,7 +157,6 @@ async def handle_transfer_event(ev, application: Application):
 
         tx_hash = ev["transactionHash"].hex()
 
-        # classify buy/sell using router + wallet
         from_is_router = is_router(from_addr)
         to_is_router = is_router(to_addr)
 
@@ -159,17 +167,14 @@ async def handle_transfer_event(ev, application: Application):
             swap_type = "🔴 SELL"
             trader = from_addr
         else:
-            # not clearly a router trade
             return
 
-        # try to get receipt, but don't crash if RPC fails
         try:
             receipt = w3.eth.get_transaction_receipt(tx_hash)
         except Exception as e:
             print(f"Receipt error for {tx_hash}: {e}")
             receipt = None
 
-        # detect WETH transfer involving the trader (best-effort only)
         weth_amount = 0.0
         if receipt is not None:
             for log in receipt.logs:
@@ -224,7 +229,11 @@ async def handle_transfer_event(ev, application: Application):
 async def watch_talos_transfers(application: Application):
     print("✅ Watching TALOS Transfer events (routers/aggregators on Arbitrum)…")
 
-    last_block = w3.eth.block_number
+    try:
+        last_block = w3.eth.block_number
+    except Exception as e:
+        print(f"Error getting initial block number: {e}")
+        return
 
     while True:
         try:
