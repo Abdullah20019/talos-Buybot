@@ -19,69 +19,55 @@ WETH_ADDRESS = Web3.to_checksum_address(os.getenv("WETH_ADDRESS"))
 
 w3 = Web3(Web3.HTTPProvider(ARB_RPC_URL))
 
-# Load pool ABI
-with open("abi/pool.json", "r") as f:
-    pool_abi = json.load(f)
+# --- ERC20 ABI with Transfer event only ---
+ERC20_ABI = json.loads("""
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "name": "from", "type": "address"},
+      {"indexed": true, "name": "to", "type": "address"},
+      {"indexed": false, "name": "value", "type": "uint256"}
+    ],
+    "name": "Transfer",
+    "type": "event"
+  }
+]
+""")
+
+talos_contract = w3.eth.contract(address=TOKEN_ADDRESS, abi=ERC20_ABI)
 
 bot = Bot(token=BOT_TOKEN)
-
-# Filled at runtime from DexScreener
-POOLS: dict[str, str] = {}
 
 DEXSCREENER_URL = (
     "https://api.dexscreener.com/latest/dex/tokens/"
     + os.getenv("TOKEN_ADDRESS")
 )
 
+# Common Arbitrum router / aggregator addresses (can extend over time)
+ROUTERS = {
+    # Camelot v3 router
+    Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),
+    # Uniswap v3 router
+    Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),
+    # Odos router
+    Web3.to_checksum_address("0x19cEeAd7105607Cd444F5ad10dd51356436095a1"),
+    # 1inch router
+    Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),
+    # OpenOcean
+    Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA")
+    # add more if needed
+}
 
-async def fetch_dexscreener_pairs():
-    """
-    Load all TALOS pairs from DexScreener and fill POOLS.
-    Only Arbitrum pairs where one side is TALOS.
-    """
-    global POOLS
-    POOLS = {}
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(DEXSCREENER_URL, timeout=10) as resp:
-                data = await resp.json()
-
-        pairs = data.get("pairs", [])
-        idx = 0
-        for p in pairs:
-            if p.get("chainId") != "arbitrum":
-                continue
-
-            pair_address = p.get("pairAddress")
-            if not pair_address:
-                continue
-
-            base = p.get("baseToken", {})
-            quote = p.get("quoteToken", {})
-            base_addr = (base.get("address") or "").lower()
-            quote_addr = (quote.get("address") or "").lower()
-
-            if TOKEN_ADDRESS.lower() not in (base_addr, quote_addr):
-                continue
-
-            dex_id = (p.get("dexId") or "DEX").upper()
-            name = f"{dex_id} ({idx})"
-            POOLS[name] = Web3.to_checksum_address(pair_address)
-            idx += 1
-
-        print("Loaded pools from DexScreener:")
-        for k, v in POOLS.items():
-            print(f" - {k}: {v}")
-
-    except Exception as e:
-        print(f"Error loading DexScreener pools: {e}")
+def is_router(addr: str) -> bool:
+    return Web3.to_checksum_address(addr) in ROUTERS
 
 
 async def get_live_stats():
     """
     Returns (talos_price_usd, market_cap, dex_name) from DexScreener.
-    Uses the first (top-liquidity) pair.
+    Uses the first (top-liquidity) pair. [web:219]
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -132,46 +118,47 @@ async def ping(update, context):
     await update.message.reply_text("Bot is alive ✅")
 
 
-async def handle_swap_event(event, pool_name):
+async def handle_transfer_event(event):
     try:
-        pool_addr = event["address"]
-        contract = w3.eth.contract(address=pool_addr, abi=pool_abi)
+        args = event["args"]
+        from_addr = args["from"]
+        to_addr = args["to"]
+        value = args["value"]
 
-        # Identify which token is TALOS and which is WETH
-        token0 = contract.functions.token0().call()
-        token1 = contract.functions.token1().call()
-
-        amount0 = event["args"]["amount0"]
-        amount1 = event["args"]["amount1"]
-        recipient = event["args"]["recipient"]
-
-        talos_delta = 0
-        weth_delta = 0
-
-        if token0.lower() == TOKEN_ADDRESS.lower():
-            talos_delta = amount0
-            if token1.lower() == WETH_ADDRESS.lower():
-                weth_delta = amount1
-        elif token1.lower() == TOKEN_ADDRESS.lower():
-            talos_delta = amount1
-            if token0.lower() == WETH_ADDRESS.lower():
-                weth_delta = amount0
-        else:
-            # Pool does not contain TALOS
-            return
-
-        talos_amount = abs(talos_delta) / 1e18
-        weth_amount = abs(weth_delta) / 1e18
-
+        # Filter out mint/burn dust etc.
+        talos_amount = value / 1e18
         if talos_amount == 0:
             return
 
-        if talos_delta > 0:
-            swap_type = "🔴 SELL"
-        elif talos_delta < 0:
+        tx_hash = event["transactionHash"].hex()
+        receipt = w3.eth.get_transaction_receipt(tx_hash)
+
+        # Classify buy / sell using router addresses.
+        # router -> user : BUY ; user -> router : SELL
+        from_is_router = is_router(from_addr)
+        to_is_router = is_router(to_addr)
+
+        if from_is_router and not to_is_router:
             swap_type = "🟢 BUY"
+            trader = to_addr
+        elif to_is_router and not from_is_router:
+            swap_type = "🔴 SELL"
+            trader = from_addr
         else:
-            swap_type = "⚪️ SWAP"
+            # transfer between wallets, airdrop, lp, etc. – ignore
+            return
+
+        # Try to find WETH amount in logs (optional; if not found, only USD from TALOS)
+        weth_amount = 0.0
+        for log in receipt.logs:
+            if log["address"].lower() == WETH_ADDRESS.lower():
+                try:
+                    # Decode as ERC20 Transfer
+                    weth_evt = talos_contract.events.Transfer().process_log(log)
+                    weth_amount = weth_evt["args"]["value"] / 1e18
+                    break
+                except Exception:
+                    continue
 
         price_usd, mcap, dex_name = await get_live_stats()
 
@@ -191,19 +178,16 @@ async def handle_swap_event(event, pool_name):
 
         robots_row = robots_for_usd(usd_value)
 
-        tx_hash = event["transactionHash"].hex()
-        title_name = dex_name or pool_name
-
         msg = (
             f"$TALOS {swap_type}! 🛒\n"
-            f"{title_name} Swap\n"
+            f"{dex_name or 'DEX'} Swap\n"
             f"{robots_row}\n\n"
             f"💰 TALOS: {talos_amount:,.2f}\n"
             f"💎 WETH: {weth_amount:.4f}\n"
             f"{value_line}\n"
             f"{price_line}\n"
             f"{mcap_line}\n"
-            f"👤 Trader: {recipient[:6]}...{recipient[-4:]}\n"
+            f"👤 Trader: {trader[:6]}...{trader[-4:]}\n"
             f"🔗 Txn: https://arbiscan.io/tx/{tx_hash}"
         )
 
@@ -212,14 +196,11 @@ async def handle_swap_event(event, pool_name):
         await bot.send_message(chat_id=CHAT_ID, text=msg)
 
     except Exception as e:
-        print(f"Error handling swap on {pool_name}: {e}")
+        print(f"Error handling transfer event: {e}")
 
 
-async def watch_pool(pool_address, pool_name):
-    pool_address = Web3.to_checksum_address(pool_address)
-    contract = w3.eth.contract(address=pool_address, abi=pool_abi)
-
-    print(f"✅ Watching {pool_name} at {pool_address}")
+async def watch_talos_transfers():
+    print("✅ Watching TALOS Transfer events (all DEXes/aggregators)…")
 
     event_filter = None
     retry_count = 0
@@ -227,35 +208,28 @@ async def watch_pool(pool_address, pool_name):
     while True:
         try:
             if event_filter is None:
-                # FIXED: correct filter syntax for Web3
-                event_filter = contract.events.Swap().create_filter(
+                event_filter = talos_contract.events.Transfer().create_filter(
                     fromBlock="latest"
                 )
-
-            if retry_count > 0:
-                print(f"✅ Reconnected to {pool_name}")
-                retry_count = 0
+                if retry_count > 0:
+                    print("✅ Reconnected transfer filter")
+                    retry_count = 0
 
             for event in event_filter.get_new_entries():
-                await handle_swap_event(event, pool_name)
+                await handle_transfer_event(event)
 
             await asyncio.sleep(2)
 
         except Exception as e:
             retry_count += 1
-            print(f"❌ Error watching {pool_name}: {str(e)[:120]}")
+            print(f"❌ Error watching transfers: {str(e)[:120]}")
             print(f"⏳ Retry #{retry_count} in 10 seconds...")
             event_filter = None
             await asyncio.sleep(10)
 
 
 async def main():
-    print("🚀 Starting TALOS Buy Bot...\n")
-
-    await fetch_dexscreener_pairs()
-    if not POOLS:
-        print("No TALOS pools loaded from DexScreener. Exiting.")
-        return
+    print("🚀 Starting TALOS Transfer Bot...\n")
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("ping", ping))
@@ -263,12 +237,8 @@ async def main():
     await application.initialize()
     await application.start()
 
-    tasks = []
-    for name, addr in POOLS.items():
-        tasks.append(asyncio.create_task(watch_pool(addr, name)))
-
     try:
-        await asyncio.gather(*tasks)
+        await watch_talos_transfers()
     finally:
         await application.stop()
         await application.shutdown()
