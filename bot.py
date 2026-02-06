@@ -49,19 +49,19 @@ ROUTER_ADDRESSES = {
     Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),
     # Uniswap v3 routers
     Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),
-    Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"),  # Router2[web:174]
+    Web3.to_checksum_address("0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"),
     # Odos
     Web3.to_checksum_address("0x19cEeAd7105607Cd444F5ad10dd51356436095a1"),
-    # 1inch aggregation router (V4/V6 commonly used on Arbitrum)[web:158][web:171]
+    # 1inch aggregation routers
     Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),
     Web3.to_checksum_address("0x111111125421CA6dc452d289314280a0f8842A65"),
     # OpenOcean
     Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA"),
-    # SushiSwap router v2 on Arbitrum[web:73]
+    # SushiSwap router v2 on Arbitrum
     Web3.to_checksum_address("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"),
-    # TraderJoe router on Arbitrum[web:73]
+    # TraderJoe router on Arbitrum
     Web3.to_checksum_address("0xbeE5c10Cf6E4F68f831E11C1D9E59B43560B3642"),
-    # OKX DEX Router (used by Jumper)[web:148]
+    # OKX DEX Router (used by Jumper)
     Web3.to_checksum_address("0x01D8EDB8eF96119d6Bada3F50463DeE6fe863B4C"),
 }
 
@@ -188,7 +188,7 @@ BUY_100_VIDEO_PATH = "100$Buy.mp4"
 SELL_100_VIDEO_PATH = "100$sell.mp4"
 BUYORSELL_500_VIDEO_PATH = "500$BuyorSell.mp4"
 
-MIN_ALERT_USD = 1      # minimum trade size to alert (now $1)
+MIN_ALERT_USD = 1      # minimum trade size to alert
 MINI_WHALE_USD = 100   # ≥100 USD trades -> 100$ videos
 MEGA_WHALE_USD = 500   # ≥500 USD trades -> 500$ video
 # -------------------------------
@@ -399,6 +399,8 @@ async def watch_talos_transfers(application: Application):
     transfer_topic = TRANSFER_EVENT_TOPIC
     print("Using Transfer topic:", transfer_topic)
 
+    LP_AND_ROUTER_SET = LP_ADDRESSES.union(ROUTER_ADDRESSES)
+
     while True:
         try:
             current_block = w3.eth.block_number
@@ -429,6 +431,15 @@ async def watch_talos_transfers(application: Application):
                         break
 
                     for ev in events:
+                        fa = ev["args"]["from"]
+                        ta = ev["args"]["to"]
+                        fa_is_lp_or_router = fa.lower() in {a.lower() for a in LP_AND_ROUTER_SET}
+                        ta_is_lp_or_router = ta.lower() in {a.lower() for a in LP_AND_ROUTER_SET}
+
+                        # Skip pure wallet↔wallet transfers
+                        if not (fa_is_lp_or_router or ta_is_lp_or_router):
+                            continue
+
                         await handle_transfer_event(ev, application)
 
                     from_block = upper + 1
