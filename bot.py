@@ -1,25 +1,31 @@
 import os
 import asyncio
 import json
-from collections import defaultdict
-from decimal import Decimal
+import time
+import aiohttp
 
 from dotenv import load_dotenv
+from telegram.ext import Application, CommandHandler
 from web3 import Web3
-from telegram.ext import Application
 
-# ────────────────────── ENV ──────────────────────
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ARB_RPC_URL = os.getenv("ARB_RPC_URL")
-TOKEN_ADDRESS = Web3.to_checksum_address(os.getenv("TOKEN_ADDRESS"))
 
-# ────────────────────── WEB3 ──────────────────────
+TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")
+WETH_ADDRESS = os.getenv("WETH_ADDRESS")
+
+if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS):
+    raise RuntimeError("Missing one or more required env vars")
+
+TOKEN_ADDRESS = Web3.to_checksum_address(TOKEN_ADDRESS)
+WETH_ADDRESS = Web3.to_checksum_address(WETH_ADDRESS)
+
 w3 = Web3(Web3.HTTPProvider(ARB_RPC_URL))
 
-# ────────────────────── ABIs ──────────────────────
+# --- Minimal ERC20 ABI (Transfer + decimals) ---
 ERC20_ABI = json.loads("""
 [
   {
@@ -37,157 +43,225 @@ ERC20_ABI = json.loads("""
     "inputs": [],
     "name": "decimals",
     "outputs": [{"name": "", "type": "uint8"}],
-    "type": "function"
-  },
-  {
-    "constant": true,
-    "inputs": [],
-    "name": "symbol",
-    "outputs": [{"name": "", "type": "string"}],
+    "stateMutability": "view",
     "type": "function"
   }
 ]
 """)
 
-TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+talos_contract = w3.eth.contract(address=TOKEN_ADDRESS, abi=ERC20_ABI)
+weth_contract = w3.eth.contract(address=WETH_ADDRESS, abi=ERC20_ABI)
 
-# ────────────────────── STABLES ──────────────────────
-STABLES = {
-    Web3.to_checksum_address("0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"),  # USDC
-    Web3.to_checksum_address("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"),  # USDT
-    Web3.to_checksum_address("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"),  # DAI
+# Read decimals once
+try:
+    TALOS_DECIMALS = talos_contract.functions.decimals().call()
+except Exception:
+    TALOS_DECIMALS = 18  # safe fallback
+
+TALOS_FACTOR = 10 ** TALOS_DECIMALS
+
+DEXSCREENER_URL = (
+    "https://api.dexscreener.com/latest/dex/tokens/" + os.getenv("TOKEN_ADDRESS")
+)
+
+# Common Arbitrum routers / aggregators (extend over time)
+ROUTERS = {
+    Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),  # Camelot
+    Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),  # Uniswap v3
+    Web3.to_checksum_address("0x19cEeAd7105607Cd444F5ad10dd51356436095a1"),  # Odos
+    Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),  # 1inch
+    Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA")   # OpenOcean
 }
 
-# ────────────────────── DEX / AGGREGATORS ──────────────────────
-DEX_ROUTERS = {Web3.to_checksum_address(r) for r in [
-    # Uniswap
-    "0xE592427A0AEce92De3Edee1F18E0157C05861564",
-    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+def is_router(addr: str) -> bool:
+    return Web3.to_checksum_address(addr) in ROUTERS
 
-    # Camelot
-    "0xc873fEcbd354f5A56E00E710B90EF4201db2448d",
+# --- DexScreener cache (to avoid rate limits) ---
+_price_cache_ts = 0.0
+_price_cache = None  # (price_usd, fdv, dex_name)
 
-    # Sushi
-    "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506",
+async def get_live_stats():
+    """
+    Returns (price_usd, fdv, dex_name) with 15s cache. [web:219]
+    """
+    global _price_cache_ts, _price_cache
 
-    # Aggregators
-    "0x1111111254EEB25477B68fb85Ed929f73A960582",  # 1inch
-    "0x19cEeAd7105607Cd444F5ad10dd51356436095a1",  # Odos
-    "0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA",  # OpenOcean
-    "0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57",  # Paraswap
-]}
+    now = time.time()
+    if _price_cache and (now - _price_cache_ts) < 15:
+        return _price_cache
 
-# ────────────────────── TOKEN META ──────────────────────
-token_contract = w3.eth.contract(address=TOKEN_ADDRESS, abi=ERC20_ABI)
-TOKEN_DECIMALS = token_contract.functions.decimals().call()
-TOKEN_SYMBOL = token_contract.functions.symbol().call()
-
-ERC20_CACHE = {}
-
-
-def get_erc20(addr):
-    if addr not in ERC20_CACHE:
-        ERC20_CACHE[addr] = w3.eth.contract(address=addr, abi=ERC20_ABI)
-    return ERC20_CACHE[addr]
-
-
-# ────────────────────── TX PROCESSOR ──────────────────────
-async def process_tx(tx_hash, app):
     try:
-        receipt = w3.eth.get_transaction_receipt(tx_hash)
-    except Exception:
-        return
+        async with aiohttp.ClientSession() as session:
+            async with session.get(DEXSCREENER_URL, timeout=10) as resp:
+                data = await resp.json()
 
-    deltas = defaultdict(Decimal)
-    participants = set()
+        pairs = data.get("pairs", [])
+        if not pairs:
+            return None, None, None
 
-    for log in receipt.logs:
-        if log["topics"][0].hex() != TRANSFER_TOPIC:
-            continue
+        p = pairs[0]
+        price_usd = float(p.get("priceUsd", 0) or 0.0)
+        fdv = float(p.get("fdv", 0) or 0.0)
+        dex_name = (p.get("dexId") or "DEX").upper()
 
-        token = Web3.to_checksum_address(log["address"])
-        contract = get_erc20(token)
+        if price_usd <= 0:
+            result = (None, fdv, dex_name)
+        else:
+            result = (price_usd, fdv, dex_name)
 
+        _price_cache = result
+        _price_cache_ts = now
+        return result
+
+    except Exception as e:
+        print(f"DexScreener error: {e}")
+        return None, None, None
+
+def robots_for_usd(usd: float) -> str:
+    if usd < 200:
+        n = 5
+    elif usd < 300:
+        n = 10
+    elif usd < 500:
+        n = 13
+    elif usd < 1000:
+        n = 20
+    elif usd < 2000:
+        n = 24
+    else:
+        n = 30
+    return "🤖" * min(n, 30)
+
+async def ping(update, context):
+    await update.message.reply_text("Bot is alive ✅")
+
+async def handle_transfer_event(ev, application: Application):
+    try:
+        args = ev["args"]
+        from_addr = args["from"]
+        to_addr = args["to"]
+        raw_value = args["value"]
+
+        talos_amount = raw_value / TALOS_FACTOR
+        if talos_amount == 0:
+            return
+
+        tx_hash = ev["transactionHash"].hex()
+
+        # classify buy/sell using router + wallet
+        from_is_router = is_router(from_addr)
+        to_is_router = is_router(to_addr)
+
+        if from_is_router and not to_is_router:
+            swap_type = "🟢 BUY"
+            trader = to_addr
+        elif to_is_router and not from_is_router:
+            swap_type = "🔴 SELL"
+            trader = from_addr
+        else:
+            # not clearly a router trade
+            return
+
+        # try to get receipt, but don't crash if RPC fails
         try:
-            evt = contract.events.Transfer().process_log(log)
-        except Exception:
-            continue
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+        except Exception as e:
+            print(f"Receipt error for {tx_hash}: {e}")
+            receipt = None
 
-        frm = evt["args"]["from"]
-        to = evt["args"]["to"]
-        val = Decimal(evt["args"]["value"]) / Decimal(10 ** contract.functions.decimals().call())
+        # detect WETH transfer involving the trader (best-effort only)
+        weth_amount = 0.0
+        if receipt is not None:
+            for log in receipt.logs:
+                if log["address"].lower() != WETH_ADDRESS.lower():
+                    continue
+                try:
+                    we = weth_contract.events.Transfer().process_log(log)
+                    f = we["args"]["from"]
+                    t = we["args"]["to"]
+                    if f.lower() == trader.lower() or t.lower() == trader.lower():
+                        weth_amount = we["args"]["value"] / 1e18
+                        break
+                except Exception:
+                    continue
 
-        deltas[(frm, token)] -= val
-        deltas[(to, token)] += val
-        participants |= {frm, to}
+        price_usd, fdv, dex_name = await get_live_stats()
+        if price_usd:
+            usd_value = talos_amount * price_usd
+            value_line = f"💵 Value: ${usd_value:,.2f}"
+            price_line = f"💲 Price: ${price_usd:.6f}"
+        else:
+            usd_value = 0.0
+            value_line = "💵 Value: N/A"
+            price_line = "💲 Price: N/A"
 
-    # Identify trader (EOA)
-    trader = next((a for a in participants if a not in DEX_ROUTERS), None)
-    if not trader:
-        return
+        if fdv:
+            fdv_line = f"🏦 FDV: ${fdv:,.1f}"
+        else:
+            fdv_line = "🏦 FDV: N/A"
 
-    token_delta = deltas.get((trader, TOKEN_ADDRESS), Decimal(0))
-    if token_delta == 0:
-        return
+        robots_row = robots_for_usd(usd_value)
 
-    is_buy = token_delta > 0
-    direction = "🟢 BUY" if is_buy else "🔴 SELL"
+        msg = (
+            f"$TALOS {swap_type}! 🛒\n"
+            f"{dex_name or 'DEX'} Swap\n"
+            f"{robots_row}\n\n"
+            f"💰 TALOS: {talos_amount:,.2f}\n"
+            f"💎 WETH: {weth_amount:.4f}\n"
+            f"{value_line}\n"
+            f"{price_line}\n"
+            f"{fdv_line}\n"
+            f"👤 Trader: {trader[:6]}...{trader[-4:]}\n"
+            f"🔗 Txn: https://arbiscan.io/tx/{tx_hash}"
+        )
 
-    # USD value via stables
-    usd_value = sum(
-        abs(v) for (addr, token), v in deltas.items()
-        if addr == trader and token in STABLES
-    )
+        print(msg.replace("\n", " | "))
+        await application.bot.send_message(chat_id=CHAT_ID, text=msg)
 
-    msg = (
-        f"${TOKEN_SYMBOL} {direction}\n\n"
-        f"💰 Amount: {abs(token_delta):,.4f}\n"
-        f"💵 USD: ${usd_value:,.2f}\n"
-        f"👤 Trader: {trader[:6]}...{trader[-4:]}\n"
-        f"🔗 https://arbiscan.io/tx/{tx_hash.hex()}"
-    )
+    except Exception as e:
+        print(f"Error handling transfer event: {e}")
 
-    await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+async def watch_talos_transfers(application: Application):
+    print("✅ Watching TALOS Transfer events (routers/aggregators on Arbitrum)…")
 
-
-# ────────────────────── BLOCK WATCHER ──────────────────────
-async def watch(app):
     last_block = w3.eth.block_number
-    print("🚀 Bot live. Watching Arbitrum swaps...")
 
     while True:
         try:
-            current = w3.eth.block_number
-            if current > last_block:
-                for b in range(last_block + 1, current + 1):
-                    block = w3.eth.get_block(b, full_transactions=True)
-                    for tx in block.transactions:
-                        if tx["to"] and tx["to"] in DEX_ROUTERS:
-                            await process_tx(tx["hash"], app)
-                last_block = current
+            current_block = w3.eth.block_number
+            if current_block > last_block:
+                from_block = last_block + 1
+                to_block = current_block
 
-            await asyncio.sleep(1)
+                events = talos_contract.events.Transfer().get_logs(
+                    fromBlock=from_block,
+                    toBlock=to_block
+                )
+                for ev in events:
+                    await handle_transfer_event(ev, application)
+
+                last_block = current_block
+
+            await asyncio.sleep(3)
 
         except Exception as e:
-            print("⚠️ Watcher error:", str(e)[:120])
-            await asyncio.sleep(5)
+            print(f"❌ Error in transfer loop: {str(e)[:160]}")
+            await asyncio.sleep(10)
 
-
-# ────────────────────── MAIN ──────────────────────
 async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    print("🚀 Starting TALOS Transfer Bot...\n")
 
-    await app.initialize()
-    await app.start()
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("ping", ping))
+
+    await application.initialize()
+    await application.start()
 
     try:
-        await watch(app)
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        print("🛑 Shutting down...")
+        await watch_talos_transfers(application)
     finally:
-        await app.stop()
-        await app.shutdown()
-
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
