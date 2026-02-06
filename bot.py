@@ -8,23 +8,40 @@ from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler
 from web3 import Web3, HTTPProvider
 
+# Load env vars if a .env file exists (safe to call even if not present)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ARB_RPC_URL = os.getenv("ARB_RPC_URL")
 
-TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")  # should be 0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9
+TOKEN_ADDRESS = os.getenv("TOKEN_ADDRESS")  # 0x30a538eFFD91ACeFb1b12CE9Bc0074eD18c9dFc9
 WETH_ADDRESS = os.getenv("WETH_ADDRESS")
 
-if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS):
-    raise RuntimeError("Missing one or more required env vars")
+UNISWAP_LP = os.getenv("UNISWAP_LP_ADDRESS")   # TALOS-WETH on Uniswap
+CAMELOT_LP = os.getenv("CAMELOT_LP_ADDRESS")   # TALOS-WETH on Camelot
+
+if not (BOT_TOKEN and CHAT_ID and ARB_RPC_URL and TOKEN_ADDRESS and WETH_ADDRESS and UNISWAP_LP and CAMELOT_LP):
+    raise RuntimeError(
+        "Missing required env vars. Need BOT_TOKEN, CHAT_ID, ARB_RPC_URL, "
+        "TOKEN_ADDRESS, WETH_ADDRESS, UNISWAP_LP_ADDRESS, CAMELOT_LP_ADDRESS"
+    )
 
 ARB_RPC_URL = ARB_RPC_URL.strip()
 print(f"Using RPC endpoint: {ARB_RPC_URL}")
 
 TOKEN_ADDRESS = Web3.to_checksum_address(TOKEN_ADDRESS)
 WETH_ADDRESS = Web3.to_checksum_address(WETH_ADDRESS)
+UNISWAP_LP = Web3.to_checksum_address(UNISWAP_LP)
+CAMELOT_LP = Web3.to_checksum_address(CAMELOT_LP)
+
+LP_ADDRESSES = {UNISWAP_LP, CAMELOT_LP}
+
+print(f"TOKEN_ADDRESS  = {TOKEN_ADDRESS}")
+print(f"WETH_ADDRESS   = {WETH_ADDRESS}")
+print("LP_ADDRESSES:")
+for lp in LP_ADDRESSES:
+    print(" -", lp)
 
 w3 = Web3(HTTPProvider(ARB_RPC_URL))
 
@@ -75,24 +92,6 @@ TALOS_FACTOR = 10 ** TALOS_DECIMALS
 DEXSCREENER_URL = (
     "https://api.dexscreener.com/latest/dex/tokens/" + os.getenv("TOKEN_ADDRESS")
 )
-
-# Routers you care about (check against Dexscreener / Arbiscan for this token)
-ROUTERS = {
-    Web3.to_checksum_address("0xc873fEcbd354f5A56E00E710B90EF4201db2448d"),  # Camelot
-    Web3.to_checksum_address("0xE592427A0AEce92De3Edee1F18E0157C05861564"),  # Uniswap v3
-    Web3.to_checksum_address("0x19cEeAd7105607Cd444F5ad10dd51356436095a1"),  # Odos
-    Web3.to_checksum_address("0x1111111254EEB25477B68fb85Ed929f73A960582"),  # 1inch
-    Web3.to_checksum_address("0x7Ed9d62C8C4D45E9249f327F57e06adF4Adad5FA")   # OpenOcean
-}
-print("Tracking routers:")
-for r in ROUTERS:
-    print(" -", r)
-
-def is_router(addr: str) -> bool:
-    try:
-        return Web3.to_checksum_address(addr) in ROUTERS
-    except Exception:
-        return False
 
 # DexScreener cache (15s)
 _price_cache_ts = 0.0
@@ -160,28 +159,31 @@ async def handle_transfer_event(ev, application: Application):
 
         talos_amount = raw_value / TALOS_FACTOR
         if talos_amount == 0:
-            print("Skip event: amount is zero")
             return
 
         tx_hash = ev["transactionHash"].hex()
 
-        from_is_router = is_router(from_addr)
-        to_is_router = is_router(to_addr)
+        from_is_lp = from_addr.lower() in {a.lower() for a in LP_ADDRESSES}
+        to_is_lp = to_addr.lower() in {a.lower() for a in LP_ADDRESSES}
 
-        print(f"Transfer event: from={from_addr} (router={from_is_router}) "
-              f"to={to_addr} (router={to_is_router}) amount={talos_amount}")
+        print(
+            f"Transfer event: from={from_addr} (lp={from_is_lp}) "
+            f"to={to_addr} (lp={to_is_lp}) amount={talos_amount}"
+        )
 
-        if from_is_router and not to_is_router:
+        # BUY: LP -> user
+        if from_is_lp and not to_is_lp:
             swap_type = "🟢 BUY"
             trader = to_addr
-        elif to_is_router and not from_is_router:
+        # SELL: user -> LP
+        elif to_is_lp and not from_is_lp:
             swap_type = "🔴 SELL"
             trader = from_addr
         else:
-            # Not a router<->user swap; ignore
-            print("Skip event: not router <-> user trade")
+            # wallet↔wallet, LP↔LP, etc. -> ignore
             return
 
+        # Try to get WETH amount from receipt
         try:
             receipt = w3.eth.get_transaction_receipt(tx_hash)
         except Exception as e:
@@ -240,7 +242,7 @@ async def handle_transfer_event(ev, application: Application):
         print(f"Error handling transfer event: {e}")
 
 async def watch_talos_transfers(application: Application):
-    print("✅ Watching TALOS Transfer events (routers/aggregators on Arbitrum)…")
+    print("✅ Watching TALOS LP-based buys/sells on Arbitrum…")
 
     try:
         last_block = w3.eth.block_number
