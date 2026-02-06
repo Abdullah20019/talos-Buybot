@@ -236,7 +236,10 @@ async def watch_talos_transfers(application: Application):
     MAX_RANGE = 250  # keep ranges small
 
     # topic0 = keccak of Transfer(address,address,uint256)
-    transfer_topic = talos_contract.events.Transfer().abi["signature"]
+    TRANSFER_EVENT_TOPIC = Web3.keccak(
+        text="Transfer(address,address,uint256)"
+    ).hex()
+    transfer_topic = TRANSFER_EVENT_TOPIC
 
     while True:
         try:
