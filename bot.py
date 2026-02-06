@@ -181,16 +181,18 @@ def robots_for_usd(usd: float) -> str:
 async def ping(update, context):
     await update.message.reply_text("Bot is alive ✅")
 
-# ---------- Media config ----------
+# ---------- Media / threshold config ----------
 IMAGE_PATH = "newimage.jpeg"
 
 BUY_100_VIDEO_PATH = "100$Buy.mp4"
 SELL_100_VIDEO_PATH = "100$sell.mp4"
 BUYORSELL_500_VIDEO_PATH = "500$BuyorSell.mp4"
 
-MIN_ALERT_USD = 1      # minimum trade size to alert
-MINI_WHALE_USD = 100   # ≥100 USD trades -> 100$ videos
-MEGA_WHALE_USD = 500   # ≥500 USD trades -> 500$ video
+BUY_MIN_USD = 100      # min BUY alert size
+SELL_MIN_USD = 3000    # min SELL alert size
+
+MINI_WHALE_USD = 100   # ≥100 USD -> 100$ videos
+MEGA_WHALE_USD = 500   # ≥500 USD -> 500$ video
 # -------------------------------
 
 async def handle_transfer_event(ev, application: Application):
@@ -265,14 +267,12 @@ async def handle_transfer_event(ev, application: Application):
                     value_eth = we["args"]["value"] / 1e18
                     total_weth_in_tx += value_eth
 
-                    # Prefer WETH directly involving trader if present
                     if (f.lower() == trader.lower() or t.lower() == trader.lower()) and not matched_for_trader:
                         weth_amount = value_eth
                         matched_for_trader = True
                 except Exception:
                     continue
 
-            # If no direct trader match, fall back to total WETH volume in tx
             if not matched_for_trader and total_weth_in_tx > 0:
                 weth_amount = total_weth_in_tx
 
@@ -287,9 +287,12 @@ async def handle_transfer_event(ev, application: Application):
             value_line = "💵 Value: N/A"
             price_line = "💲 Price: N/A"
 
-        # Minimum alert filter
-        if usd_value < MIN_ALERT_USD:
-            print(f"Skip trade below min alert size: ${usd_value:.2f}")
+        # Side-specific minimums
+        if swap_type == "🟢 BUY" and usd_value < BUY_MIN_USD:
+            print(f"Skip BUY below min size: ${usd_value:.2f}")
+            return
+        if swap_type == "🔴 SELL" and usd_value < SELL_MIN_USD:
+            print(f"Skip SELL below min size: ${usd_value:.2f}")
             return
 
         if fdv:
@@ -323,7 +326,7 @@ async def handle_transfer_event(ev, application: Application):
         print("Preparing Telegram media send. USD value:", usd_value)
 
         # ---------- Media rules ----------
-        # 1) Mega whale (>= 500 USD): use 500$BuyorSell video for both buys & sells
+        # 1) Mega whale (>= 500 USD): 500$ video (only relevant once BUY/SELL mins passed)
         if usd_value >= MEGA_WHALE_USD and os.path.exists(BUYORSELL_500_VIDEO_PATH):
             print("Sending 500$BuyorSell mega-whale video")
             with open(BUYORSELL_500_VIDEO_PATH, "rb") as f:
@@ -334,8 +337,8 @@ async def handle_transfer_event(ev, application: Application):
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-        # 2) 100–499 USD BUY: use 100$Buy video
-        elif usd_value >= MINI_WHALE_USD and swap_type == "🟢 BUY" and os.path.exists(BUY_100_VIDEO_PATH):
+        # 2) 100–499 USD BUY: 100$Buy video (only for buys, and buys are already ≥100)
+        elif swap_type == "🟢 BUY" and usd_value >= MINI_WHALE_USD and os.path.exists(BUY_100_VIDEO_PATH):
             print("Sending 100$Buy mini-whale BUY video")
             with open(BUY_100_VIDEO_PATH, "rb") as f:
                 await application.bot.send_video(
@@ -345,9 +348,9 @@ async def handle_transfer_event(ev, application: Application):
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-        # 3) 100–499 USD SELL: use 100$sell video
-        elif usd_value >= MINI_WHALE_USD and swap_type == "🔴 SELL" and os.path.exists(SELL_100_VIDEO_PATH):
-            print("Sending 100$sell mini-whale SELL video")
+        # 3) 100–499 USD SELL: 100$sell video, but only for sells that are >= 3000
+        elif swap_type == "🔴 SELL" and usd_value >= max(MINI_WHALE_USD, SELL_MIN_USD) and os.path.exists(SELL_100_VIDEO_PATH):
+            print("Sending 100$sell SELL video (>=3000)")
             with open(SELL_100_VIDEO_PATH, "rb") as f:
                 await application.bot.send_video(
                     chat_id=CHAT_ID,
@@ -356,7 +359,7 @@ async def handle_transfer_event(ev, application: Application):
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-        # 4) Smaller trades (but ≥ MIN_ALERT_USD): send static image
+        # 4) Smaller trades that passed min (BUY ≥100, SELL ≥3000): image
         elif os.path.exists(IMAGE_PATH):
             print("Sending image alert")
             with open(IMAGE_PATH, "rb") as f:
@@ -389,10 +392,8 @@ async def watch_talos_transfers(application: Application):
         print(f"Error getting initial block number: {e}")
         return
 
-    # Small range to avoid QuickNode 413 Request Entity Too Large
     MAX_RANGE = 5
 
-    # topic0 = keccak of Transfer(address,address,uint256)
     TRANSFER_EVENT_TOPIC = Web3.keccak(
         text="Transfer(address,address,uint256)"
     ).hex()
