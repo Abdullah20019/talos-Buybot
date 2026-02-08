@@ -63,6 +63,9 @@ ROUTER_ADDRESSES = {
     Web3.to_checksum_address("0xbeE5c10Cf6E4F68f831E11C1D9E59B43560B3642"),
     # OKX DEX Router (used by Jumper)
     Web3.to_checksum_address("0x01D8EDB8eF96119d6Bada3F50463DeE6fe863B4C"),
+
+Web3.to_checksum_address("0x9008D19f58AAbD9eD0D60971565AA8510560ab41")   
+    # CoW Protocol GPv2Settlement
 }
 
 print(f"TOKEN_ADDRESS  = {TOKEN_ADDRESS}")
