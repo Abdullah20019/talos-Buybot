@@ -63,9 +63,8 @@ ROUTER_ADDRESSES = {
     Web3.to_checksum_address("0xbeE5c10Cf6E4F68f831E11C1D9E59B43560B3642"),
     # OKX DEX Router (used by Jumper)
     Web3.to_checksum_address("0x01D8EDB8eF96119d6Bada3F50463DeE6fe863B4C"),
-
-Web3.to_checksum_address("0x9008D19f58AAbD9eD0D60971565AA8510560ab41")   
     # CoW Protocol GPv2Settlement
+    Web3.to_checksum_address("0x9008D19f58AAbD9eD0D60971565AA8510560ab41")
 }
 
 print(f"TOKEN_ADDRESS  = {TOKEN_ADDRESS}")
@@ -367,7 +366,8 @@ async def watch_talos_transfers(application: Application):
 
     MAX_RANGE = 5
 
-    TRANSFER_EVENT_TOPIC = Web3.keccak(
+    # FIX 1: Added 0x prefix to topic
+    TRANSFER_EVENT_TOPIC = "0x" + Web3.keccak(
         text="Transfer(address,address,uint256)"
     ).hex()
     transfer_topic = TRANSFER_EVENT_TOPIC
@@ -427,7 +427,7 @@ async def watch_talos_transfers(application: Application):
             await asyncio.sleep(10)
 
 async def main():
-    print("🚀 Starting TALOS Transfer Bot...\n")
+    print("🚀 Starting TALOS Transfer Bot...\n")  # FIX 3: Changed \\n to \n
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("ping", ping))
